@@ -1,632 +1,969 @@
 /*************************************************
- * PROYECTO UPG - VERSION REESCRITA Y ORDENADA
+ * PROYECTO UPG - ORQUESTADOR POR FASES
+ * Compatible con Google Apps Script
  *************************************************/
 
-/* =========================
-   MENÚ
-   ========================= */
+var UPG = {
+  SHEETS: {
+    RAW_TXN: 'RAW_TXN',
+    DISPLAY_OUT: 'DISPLAY_OUT',
+    LOG1_RAW: 'LOG1_RAW',
+    LOG1_ANALISIS: 'LOG1_ANALISIS',
+    SABRE_PASS2: 'SABRE_PASS2',
+    LOG2_RAW: 'LOG2_RAW',
+    FINAL: 'FINAL',
+    CONFIG: 'CONFIG',
+    TRACE: 'TRACE'
+  },
+  STAGE: {
+    PREP_DISPLAY: 1,
+    PROCESS_LOG1: 2,
+    BUILD_PASS2: 3,
+    PROCESS_LOG2: 4,
+    FINAL_RESULT: 5
+  },
+  STATUS: {
+    OK: 'OK',
+    REVIEW: 'REVISAR',
+    NO_MATCH: 'SIN COINCIDENCIA',
+    NO_REL: 'SIN RELACION',
+    DOCV: 'VERIFY TRAVEL DOCUMENT DATA, THEN ADD DOCV',
+    DUP: 'NOMBRE DUPLICADO',
+    READY: 'LISTO'
+  }
+};
 
-function doGet(e) {
-  return HtmlService.createHtmlOutput("¡Hola, mundo!");
+function doGet() {
+  return HtmlService.createHtmlOutput('UPG por fases listo. Usa el menú UPG.');
 }
 
 function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('Gestión de Datos')
-    .addItem('Display', 'upgDisplay')
-    .addItem('Buscar Nombres', 'upgBuscarNombres')
-    .addItem('Buscar Duplicados', 'upgBuscarDuplicidades')
-    .addItem('Insertar Números', 'upgInsertarNumeroDesdeColumnaC')
-    .addItem('Status Final', 'upgEstatusFinal')
+  SpreadsheetApp.getUi()
+    .createMenu('UPG')
+    .addItem('Inicializar estructura', 'upgSetup')
+    .addSeparator()
+    .addItem('Ejecutar etapa actual (CONFIG)', 'upgRunCurrentStage')
+    .addSeparator()
+    .addItem('Etapa 1 - Preparar Display', 'upgStage1PrepareDisplay')
+    .addItem('Etapa 2 - Procesar Log 1', 'upgStage2ProcessLog1')
+    .addItem('Etapa 3 - Generar salida para Sabre (pasada 2)', 'upgStage3BuildPass2')
+    .addItem('Etapa 4 - Resultado final equivalente (Log 2)', 'upgStage4ProcessLog2')
+    .addItem('Etapa 5 - Cierre', 'upgStage5Finalize')
+    .addItem('Validar equivalencia final', 'upgValidateFinalEquivalenceFromSheets')
     .addToUi();
 }
 
-/* =========================
-   DISPLAY
-   ========================= */
+function upgSetup() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  upgEnsureStructure(ss);
+  upgTrace('SETUP', 'Estructura inicializada', 0);
+  SpreadsheetApp.getActive().toast('Estructura lista. Usa RAW_TXN/LOG1_RAW/LOG2_RAW según etapa.');
+}
 
-function upgDisplay() {
-  const hoja = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  const ultimaFila = hoja.getLastRow();
-  if (ultimaFila === 0) return;
+function upgRunCurrentStage() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  upgEnsureStructure(ss);
 
-  const valores = hoja.getRange(1, 1, ultimaFila, 1).getValues();
-  const resultados = [];
+  var cfg = upgReadConfig(ss.getSheetByName(UPG.SHEETS.CONFIG));
+  var stage = Number(cfg.currentStage || 1);
 
-  for (let i = 0; i < valores.length; i++) {
-    const valor = valores[i][0];
+  if (stage === UPG.STAGE.PREP_DISPLAY) return upgStage1PrepareDisplay();
+  if (stage === UPG.STAGE.PROCESS_LOG1) return upgStage2ProcessLog1();
+  if (stage === UPG.STAGE.BUILD_PASS2) return upgStage3BuildPass2();
+  if (stage === UPG.STAGE.PROCESS_LOG2) return upgStage4ProcessLog2();
+  if (stage === UPG.STAGE.FINAL_RESULT) return upgStage5Finalize();
 
-    if (!valor) {
-      resultados.push(['']);
-      continue;
-    }
-
-    const texto = valor.toString();
-    const indice = texto.indexOf('‡');
-    let textoHasta = indice !== -1 ? texto.substring(0, indice) : texto;
-
-    if (textoHasta.endsWith('^EI^E')) {
-      resultados.push([textoHasta]);
-    } else {
-      const limpio = textoHasta.replace(/(\^)+$/, '');
-      resultados.push([limpio + '^EI^E']);
-    }
-  }
-
-  hoja.getRange(1, 2, resultados.length, 1).setValues(resultados);
+  SpreadsheetApp.getActive().toast('CURRENT_STAGE inválido en CONFIG.');
 }
 
 /* =========================
-   BUSCAR NOMBRES
+   ETAPA 1
    ========================= */
 
-function upgBuscarNombres() {
-  const hoja = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  const ultimaFila = hoja.getLastRow();
-  if (ultimaFila === 0) return;
+function upgStage1PrepareDisplay() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  upgEnsureStructure(ss);
 
-  const data = hoja.getRange(1, 1, ultimaFila, 1).getValues().flat();
+  var rawSheet = ss.getSheetByName(UPG.SHEETS.RAW_TXN);
+  var outSheet = ss.getSheetByName(UPG.SHEETS.DISPLAY_OUT);
+  var cfgSheet = ss.getSheetByName(UPG.SHEETS.CONFIG);
+  var cfg = upgReadConfig(cfgSheet);
 
-  hoja.getRange(1, 2, hoja.getMaxRows(), 3).clearContent().setBackground(null);
-
-  const resultados = [];
-  const palabrasComunes = ['angel', 'joy', 'passenger', 'list', 'doc'];
-
-  for (let i = 0; i < data.length; i++) {
-    const line = upgSafeTrim(data[i]);
-
-    if (!line || !line.startsWith("G-")) continue;
-
-    const gLine = line;
-    const nombreCompleto = upgExtraerNombreDesdeLineaG(gLine);
-
-    if (!nombreCompleto) {
-      resultados.push([gLine, "", "SIN COINCIDENCIA"]);
-      continue;
-    }
-
-    let mejorCoincidencia = {
-      nombre: "",
-      numero: "",
-      similitud: 0
-    };
-
-    let estadoEspecial = "";
-    const similitudMinima = nombreCompleto.length < 5 ? 0.9 : 0.8;
-
-    for (let j = i + 1; j < data.length; j++) {
-      const nextLine = upgSafeTrim(data[j]);
-
-      if (!nextLine) continue;
-
-      if (nextLine.startsWith("IGD")) {
-        break;
-      }
-
-      if (nextLine.includes("VERIFY TRAVEL DOCUMENT DATA, THEN ADD DOCV")) {
-        estadoEspecial = "VERIFY TRAVEL DOCUMENT DATA, THEN ADD DOCV";
-        break;
-      }
-
-      if (nextLine.startsWith("‡") || nextLine.includes("TICKETLESS")) {
-        mejorCoincidencia = {
-          nombre: nombreCompleto,
-          numero: "1",
-          similitud: 1
-        };
-        break;
-      }
-
-      if (!/^\d/.test(nextLine)) continue;
-
-      const numero = upgExtraerNumero(nextLine);
-      const nombreEncontrado = upgExtraerNombreDesdeLineaNumerada(nextLine);
-
-      if (!nombreEncontrado) continue;
-
-      const nombreEncontradoNormalizado = upgNormalizarNombre(nombreEncontrado);
-
-      if (palabrasComunes.includes(nombreEncontradoNormalizado)) {
-        continue;
-      }
-
-      const similitud = upgCompararSimilitudNombreCompleto(nombreCompleto, nombreEncontrado);
-
-      if (upgNormalizarNombre(nombreCompleto) === nombreEncontradoNormalizado) {
-        mejorCoincidencia = {
-          nombre: nombreEncontrado,
-          numero: numero,
-          similitud: 1
-        };
-        break;
-      }
-
-      if (similitud >= similitudMinima && similitud > mejorCoincidencia.similitud) {
-        mejorCoincidencia = {
-          nombre: nombreEncontrado,
-          numero: numero,
-          similitud: similitud
-        };
-      }
-    }
-
-    let valorColumnaC = "";
-    let estado = "SIN COINCIDENCIA";
-
-    if (estadoEspecial === "VERIFY TRAVEL DOCUMENT DATA, THEN ADD DOCV") {
-      valorColumnaC = "";
-      estado = "VERIFY TRAVEL DOCUMENT DATA, THEN ADD DOCV";
-    } else if (mejorCoincidencia.similitud >= similitudMinima) {
-      valorColumnaC = `${mejorCoincidencia.numero} ${mejorCoincidencia.nombre}`.trim();
-      estado = upgValidarRelacionNombre(nombreCompleto, mejorCoincidencia.nombre);
-    }
-
-    resultados.push([gLine, valorColumnaC, estado]);
+  var last = rawSheet.getLastRow();
+  if (last < 2) {
+    upgClearDataRows(outSheet, 4);
+    upgTrace('ETAPA_1', 'RAW_TXN vacío', 0);
+    SpreadsheetApp.getActive().toast('RAW_TXN no tiene transacciones.');
+    return;
   }
 
-  if (resultados.length === 0) return;
+  var data = rawSheet.getRange(2, 1, last - 1, 1).getValues();
+  var rows = [];
 
-  hoja.getRange(1, 2, resultados.length, 3).setValues(resultados);
+  for (var i = 0; i < data.length; i++) {
+    var raw = upgSafeTrim(data[i][0]);
+    if (!raw) continue;
 
-  for (let i = 0; i < resultados.length; i++) {
-    const estado = resultados[i][2];
-    let color = "#f4cccc";
-
-    if (estado === "OK") {
-      color = "#d9ead3";
-    } else if (estado === "REVISAR") {
-      color = "#fff2cc";
-    } else if (estado === "VERIFY TRAVEL DOCUMENT DATA, THEN ADD DOCV") {
-      color = "#cfe2f3";
-    }
-
-    hoja.getRange(i + 1, 2, 1, 3).setBackground(color);
+    rows.push([
+      raw,
+      upgBuildDisplay(raw),
+      UPG.STATUS.READY,
+      'Copiar DISPLAY_CMD a Sabre y pegar respuesta en LOG1_RAW'
+    ]);
   }
+
+  upgClearDataRows(outSheet, 4);
+  if (rows.length) outSheet.getRange(2, 1, rows.length, 4).setValues(rows);
+
+  upgSetCurrentStage(cfgSheet, cfg.autoAdvance ? UPG.STAGE.PROCESS_LOG1 : UPG.STAGE.PREP_DISPLAY);
+  upgTrace('ETAPA_1', 'Display preparado', rows.length);
+  SpreadsheetApp.getActive().toast('Etapa 1 lista: ' + rows.length + ' comandos.');
 }
 
 /* =========================
-   BUSCAR DUPLICIDADES
+   ETAPA 2
    ========================= */
 
-function upgBuscarDuplicidades() {
-  const hoja = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  const ultimaFila = hoja.getLastRow();
-  if (ultimaFila === 0) return;
+function upgStage2ProcessLog1() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  upgEnsureStructure(ss);
 
-  const data = hoja.getRange(1, 1, ultimaFila, 1).getValues().flat();
-  const resultados = [];
+  var cfgSheet = ss.getSheetByName(UPG.SHEETS.CONFIG);
+  var cfg = upgReadConfig(cfgSheet);
+  var log1Sheet = ss.getSheetByName(UPG.SHEETS.LOG1_RAW);
+  var analysisSheet = ss.getSheetByName(UPG.SHEETS.LOG1_ANALISIS);
 
-  hoja.getRange(1, 5, hoja.getMaxRows(), 3).clearContent().setBackground(null);
+  var lines = upgReadSingleColumn(log1Sheet);
+  if (!lines.length) {
+    upgClearDataRows(analysisSheet, 14);
+    upgTrace('ETAPA_2', 'LOG1_RAW vacío', 0);
+    SpreadsheetApp.getActive().toast('Pega el primer .log en LOG1_RAW antes de etapa 2.');
+    return;
+  }
 
-  for (let i = 0; i < data.length; i++) {
-    const line = upgSafeTrim(data[i]);
+  var blocks = upgBuildBlocks(lines);
+  var rows = upgAnalyzeBlocksForLog1(blocks, cfg);
 
-    if (!line || !line.startsWith("G-")) continue;
+  upgClearDataRows(analysisSheet, 14);
+  if (rows.length) analysisSheet.getRange(2, 1, rows.length, 14).setValues(rows);
+  upgPaintByStatus(analysisSheet, rows, 2, 14, 5);
 
-    const gLine = line;
-    const nombresPorClave = {};
-    const lineasPorClave = {};
+  upgSetCurrentStage(cfgSheet, cfg.autoAdvance ? UPG.STAGE.BUILD_PASS2 : UPG.STAGE.PROCESS_LOG1);
+  upgTrace('ETAPA_2', 'Log 1 procesado', rows.length);
+  SpreadsheetApp.getActive().toast('Etapa 2 lista: ' + rows.length + ' bloques.');
+}
 
-    for (let j = i + 1; j < data.length; j++) {
-      const nextLine = upgSafeTrim(data[j]);
+/* =========================
+   ETAPA 3
+   ========================= */
 
-      if (!nextLine) continue;
+function upgStage3BuildPass2() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  upgEnsureStructure(ss);
 
-      if (nextLine.startsWith("IGD")) {
-        break;
-      }
+  var cfgSheet = ss.getSheetByName(UPG.SHEETS.CONFIG);
+  var cfg = upgReadConfig(cfgSheet);
+  var analysisSheet = ss.getSheetByName(UPG.SHEETS.LOG1_ANALISIS);
+  var pass2Sheet = ss.getSheetByName(UPG.SHEETS.SABRE_PASS2);
 
-      if (!/^\d/.test(nextLine)) continue;
+  var data = upgReadRangeData(analysisSheet, 2, 1, 14);
+  if (!data.length) {
+    upgClearDataRows(pass2Sheet, 5);
+    upgTrace('ETAPA_3', 'LOG1_ANALISIS sin datos', 0);
+    SpreadsheetApp.getActive().toast('Corre etapa 2 primero.');
+    return;
+  }
 
-      const nombreEncontrado = upgExtraerNombreDesdeLineaNumerada(nextLine);
-      if (!nombreEncontrado) continue;
-
-      const nombreBase = upgConstruirNombreBaseDuplicidad(nombreEncontrado);
-      if (!nombreBase) continue;
-
-      if (!nombresPorClave[nombreBase]) {
-        nombresPorClave[nombreBase] = 0;
-        lineasPorClave[nombreBase] = [];
-      }
-
-      nombresPorClave[nombreBase]++;
-      lineasPorClave[nombreBase].push(nextLine);
-    }
-
-    const clavesDuplicadas = Object.keys(nombresPorClave).filter(clave => nombresPorClave[clave] > 1);
-
-    if (clavesDuplicadas.length > 0) {
-      let lineasDuplicadas = [];
-
-      clavesDuplicadas.forEach(clave => {
-        lineasDuplicadas = lineasDuplicadas.concat(lineasPorClave[clave]);
-      });
-
-      resultados.push([
-        gLine,
-        lineasDuplicadas.join("\n"),
-        "NOMBRE DUPLICADO"
-      ]);
-    } else {
-      resultados.push([
-        gLine,
-        "No se encontraron duplicidades",
-        ""
+  var rows = [];
+  for (var i = 0; i < data.length; i++) {
+    var status = data[i][5];
+    if (status === UPG.STATUS.OK || status === UPG.STATUS.REVIEW) {
+      rows.push([
+        data[i][0],
+        data[i][8],
+        status === UPG.STATUS.OK ? UPG.STATUS.READY : UPG.STATUS.REVIEW,
+        'Enviar COMANDO_SABRE_P2 a Sabre y pegar respuesta en LOG2_RAW',
+        data[i][13]
       ]);
     }
   }
 
-  if (resultados.length === 0) return;
+  upgClearDataRows(pass2Sheet, 5);
+  if (rows.length) pass2Sheet.getRange(2, 1, rows.length, 5).setValues(rows);
 
-  hoja.getRange(1, 5, resultados.length, 3).setValues(resultados);
-
-  for (let i = 0; i < resultados.length; i++) {
-    if (resultados[i][2] === "NOMBRE DUPLICADO") {
-      hoja.getRange(i + 1, 5, 1, 3).setBackground("#f4cccc");
-    }
-  }
+  upgSetCurrentStage(cfgSheet, cfg.autoAdvance ? UPG.STAGE.PROCESS_LOG2 : UPG.STAGE.BUILD_PASS2);
+  upgTrace('ETAPA_3', 'Salida pasada 2 generada', rows.length);
+  SpreadsheetApp.getActive().toast('Etapa 3 lista: ' + rows.length + ' comandos para Sabre.');
 }
 
 /* =========================
-   INSERTAR NÚMERO DESDE C
+   ETAPA 4 (EQUIVALENTE FUNCIONAL A upgEstatusFinal ORIGINAL)
    ========================= */
 
-function upgInsertarNumeroDesdeColumnaC() {
-  const hoja = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  const ultimaFila = hoja.getLastRow();
-  if (ultimaFila === 0) return;
+function upgStage4ProcessLog2() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  upgEnsureStructure(ss);
 
-  const dataB = hoja.getRange(1, 2, ultimaFila, 1).getValues();
-  const dataC = hoja.getRange(1, 3, ultimaFila, 1).getValues();
+  var cfgSheet = ss.getSheetByName(UPG.SHEETS.CONFIG);
+  var cfg = upgReadConfig(cfgSheet);
+  var log2Sheet = ss.getSheetByName(UPG.SHEETS.LOG2_RAW);
+  var finalSheet = ss.getSheetByName(UPG.SHEETS.FINAL);
 
-  const salidaB = [];
-
-  for (let i = 0; i < ultimaFila; i++) {
-    const celdaB = dataB[i][0];
-    const celdaC = dataC[i][0];
-
-    if (!celdaB || !celdaC) {
-      salidaB.push([celdaB || ""]);
-      continue;
-    }
-
-    const matchNumero = celdaC.toString().match(/^\d+/);
-
-    if (!matchNumero) {
-      salidaB.push([celdaB]);
-      continue;
-    }
-
-    const numero = matchNumero[0];
-    const textoB = celdaB.toString();
-
-    const partes = textoB.split('^');
-    const parteAntesCaret = partes[0];
-    const parteDespuesCaret = partes.slice(1).join('^');
-
-    const modificadaDespuesCaret = parteDespuesCaret
-      .replace(/\bEG-(?!\d)/g, 'EG-' + numero)
-      .replace(/\bKG(?!\d|[-])/g, 'KG' + numero);
-
-    const resultadoFinal = parteAntesCaret + '^' + modificadaDespuesCaret;
-    salidaB.push([resultadoFinal]);
+  var lines = upgReadSingleColumn(log2Sheet);
+  if (!lines.length) {
+    upgClearDataRows(finalSheet, 6);
+    upgTrace('ETAPA_4', 'LOG2_RAW vacío', 0);
+    SpreadsheetApp.getActive().toast('Pega el segundo .log en LOG2_RAW antes de etapa 4.');
+    return;
   }
 
-  hoja.getRange(1, 2, salidaB.length, 1).setValues(salidaB);
+  var mappings = upgReadFinalMappings(cfg);
+
+  // Refactor estructural (equivalente esperado)
+  var refactorResult = upgComputeFinalStatusRefactor(lines, mappings.findList, mappings.replaceList);
+  var rows = upgBuildFinalSheetRows(refactorResult);
+
+  upgClearDataRows(finalSheet, 6);
+  if (rows.length) finalSheet.getRange(2, 1, rows.length, 6).setValues(rows);
+  upgPaintByStatus(finalSheet, rows, 2, 6, 3);
+
+  // Validación de equivalencia contra la traducción literal del algoritmo original
+  var originalResult = upgComputeFinalStatusOriginalLiteral(lines, mappings.findList, mappings.replaceList);
+  var validation = upgCompareFinalResults(originalResult, refactorResult);
+  upgTrace('ETAPA_4_VALIDACION', validation.message, validation.mismatchCount);
+
+  upgSetCurrentStage(cfgSheet, cfg.autoAdvance ? UPG.STAGE.FINAL_RESULT : UPG.STAGE.PROCESS_LOG2);
+  upgTrace('ETAPA_4', 'Resultado final calculado', rows.length);
+  SpreadsheetApp.getActive().toast('Etapa 4 lista. Validación equivalencia: ' + validation.message);
 }
 
-/* =========================
-   STATUS FINAL
-   ========================= */
+function upgReadFinalMappings(cfg) {
+  return {
+    findList: upgCsvArray(cfg.finalFindList),
+    replaceList: upgCsvArray(cfg.finalReplaceList)
+  };
+}
 
-function upgEstatusFinal() {
-  const hoja = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  const ultimaFila = hoja.getLastRow();
-  if (ultimaFila === 0) return;
+/**
+ * Traducción literal de upgEstatusFinal original:
+ * - Toma líneas G que cumplan /^G-.*(J80|J20|J18)$/
+ * - Busca en líneas siguientes la primera que contenga cualquier token de erroresF
+ * - Si no encuentra, vacío
+ * - Luego reemplaza solo si hay igualdad exacta con erroresF[k] por reemplazosG[k]
+ */
+function upgComputeFinalStatusOriginalLiteral(datosA, erroresF, reemplazosG) {
+  var resultadosB = [];
+  var resultadosC = [];
+  var patronLinea = /^G-.*(J80|J20|J18)$/;
 
-  const datosA = hoja.getRange(1, 1, ultimaFila, 1).getValues().flat();
-  const datosF = hoja.getRange(2, 6, Math.max(ultimaFila - 1, 1), 1).getValues();
-  const datosG = hoja.getRange(2, 7, Math.max(ultimaFila - 1, 1), 1).getValues();
+  for (var i = 0; i < datosA.length; i++) {
+    var texto = datosA[i];
+    if (!texto || !patronLinea.test(String(texto))) continue;
 
-  const erroresF = datosF
-    .map(row => row[0])
-    .filter(v => v !== "" && v !== null && v !== undefined);
+    resultadosB.push(String(texto));
+    var encontrado = false;
 
-  const reemplazosG = datosG.map(row => row[0]);
+    for (var j = i + 1; j < datosA.length && !encontrado; j++) {
+      var textoDebajo = datosA[j];
+      if (typeof textoDebajo !== 'string' || textoDebajo.trim() === '') continue;
 
-  const resultadosB = [];
-  const resultadosC = [];
-  const patronLinea = /^G-.*(J80|J20|J18)$/;
-
-  for (let i = 0; i < datosA.length; i++) {
-    const texto = datosA[i];
-
-    if (!texto || !patronLinea.test(texto.toString())) continue;
-
-    resultadosB.push([texto]);
-
-    let encontrado = false;
-
-    for (let j = i + 1; j < datosA.length && !encontrado; j++) {
-      const textoDebajo = datosA[j];
-
-      if (typeof textoDebajo !== 'string' || textoDebajo.trim() === '') {
-        continue;
-      }
-
-      for (let k = 0; k < erroresF.length; k++) {
-        if (textoDebajo.includes(erroresF[k])) {
-          resultadosC.push([textoDebajo]);
+      for (var k = 0; k < erroresF.length; k++) {
+        if (String(textoDebajo).indexOf(erroresF[k]) !== -1) {
+          resultadosC.push(String(textoDebajo));
           encontrado = true;
           break;
         }
       }
     }
 
-    if (!encontrado) {
-      resultadosC.push([""]);
-    }
+    if (!encontrado) resultadosC.push('');
   }
 
-  hoja.getRange(1, 2, hoja.getMaxRows(), 2).clearContent();
-
-  if (resultadosB.length > 0) {
-    hoja.getRange(1, 2, resultadosB.length, 1).setValues(resultadosB);
-  }
-
-  if (resultadosC.length > 0) {
-    hoja.getRange(1, 3, resultadosC.length, 1).setValues(resultadosC);
-  }
-
-  const datosCActuales = resultadosC.length > 0
-    ? hoja.getRange(1, 3, resultadosC.length, 1).getValues()
-    : [];
-
-  for (let i = 0; i < datosCActuales.length; i++) {
-    const valorC = datosCActuales[i][0];
-
-    for (let j = 0; j < erroresF.length; j++) {
-      if (valorC === erroresF[j]) {
-        datosCActuales[i][0] = reemplazosG[j];
+  var resultadosCReemplazados = resultadosC.slice();
+  for (i = 0; i < resultadosCReemplazados.length; i++) {
+    for (j = 0; j < erroresF.length; j++) {
+      if (resultadosCReemplazados[i] === erroresF[j]) {
+        resultadosCReemplazados[i] = reemplazosG[j] !== undefined ? reemplazosG[j] : resultadosCReemplazados[i];
         break;
       }
     }
   }
 
-  if (datosCActuales.length > 0) {
-    hoja.getRange(1, 3, datosCActuales.length, 1).setValues(datosCActuales);
-  }
+  return {
+    gLines: resultadosB,
+    rawMatches: resultadosC,
+    finalMatches: resultadosCReemplazados
+  };
 }
 
-/* =========================
-   VALIDACIÓN DE NOMBRES
-   ========================= */
+/**
+ * Misma lógica funcional, pero organizada para trazabilidad.
+ */
+function upgComputeFinalStatusRefactor(datosA, erroresF, reemplazosG) {
+  var gLines = [];
+  var rawMatches = [];
+  var finalMatches = [];
+  var patronLinea = /^G-.*(J80|J20|J18)$/;
 
-function upgValidarRelacionNombre(nombreOriginal, nombreEncontrado) {
-  const original = upgNormalizarNombre(nombreOriginal).split(" ").filter(Boolean);
-  const encontrado = upgNormalizarNombre(nombreEncontrado).split(" ").filter(Boolean);
+  for (var i = 0; i < datosA.length; i++) {
+    var line = datosA[i];
+    if (!line || !patronLinea.test(String(line))) continue;
 
-  if (original.length === 0 || encontrado.length === 0) {
-    return "SIN COINCIDENCIA";
-  }
+    gLines.push(String(line));
 
-  const palabrasCompartidas = original.filter(p => encontrado.includes(p));
+    var match = '';
+    var found = false;
 
-  if (original.join(" ") === encontrado.join(" ")) {
-    return "OK";
-  }
+    for (var j = i + 1; j < datosA.length && !found; j++) {
+      var candidate = datosA[j];
+      if (typeof candidate !== 'string' || candidate.trim() === '') continue;
 
-  if (palabrasCompartidas.length >= 2) {
-    return "REVISAR";
-  }
-
-  if (palabrasCompartidas.length === 1) {
-    let mejorSimilitud = 0;
-
-    for (let i = 0; i < original.length; i++) {
-      for (let j = 0; j < encontrado.length; j++) {
-        const sim = upgJaroWinkler(original[i], encontrado[j]);
-        if (sim > mejorSimilitud) {
-          mejorSimilitud = sim;
+      for (var k = 0; k < erroresF.length; k++) {
+        if (String(candidate).indexOf(erroresF[k]) !== -1) {
+          match = String(candidate);
+          found = true;
+          break;
         }
       }
     }
 
-    if (mejorSimilitud >= 0.93) {
-      return "REVISAR";
+    rawMatches.push(match);
+
+    var replaced = match;
+    for (k = 0; k < erroresF.length; k++) {
+      if (replaced === erroresF[k]) {
+        replaced = reemplazosG[k] !== undefined ? reemplazosG[k] : replaced;
+        break;
+      }
     }
 
-    return "SIN RELACION";
+    finalMatches.push(replaced);
   }
 
-  let coincidenciasFuertes = 0;
+  return {
+    gLines: gLines,
+    rawMatches: rawMatches,
+    finalMatches: finalMatches
+  };
+}
 
-  for (let i = 0; i < original.length; i++) {
-    for (let j = 0; j < encontrado.length; j++) {
-      const sim = upgJaroWinkler(original[i], encontrado[j]);
-      if (sim >= 0.93) {
-        coincidenciasFuertes++;
+function upgBuildFinalSheetRows(result) {
+  var rows = [];
+
+  for (var i = 0; i < result.gLines.length; i++) {
+    var rawMatch = result.rawMatches[i] || '';
+    var finalMatch = result.finalMatches[i] || '';
+    var status = finalMatch ? UPG.STATUS.OK : UPG.STATUS.REVIEW;
+
+    var confidence = finalMatch ? 100 : 0;
+    var motivoDecision = finalMatch
+      ? (rawMatch !== finalMatch ? 'Reemplazo exacto aplicado según mapeo original.' : 'Coincidencia encontrada por criterio original.')
+      : 'Sin coincidencia por criterio original.';
+
+    rows.push([
+      result.gLines[i],
+      rawMatch,
+      finalMatch,
+      status,
+      confidence,
+      motivoDecision
+    ]);
+  }
+
+  return rows;
+}
+
+function upgCompareFinalResults(originalResult, refactorResult) {
+  var mismatches = 0;
+
+  if (originalResult.gLines.length !== refactorResult.gLines.length) mismatches++;
+
+  var len = Math.max(originalResult.gLines.length, refactorResult.gLines.length);
+  for (var i = 0; i < len; i++) {
+    if ((originalResult.gLines[i] || '') !== (refactorResult.gLines[i] || '')) mismatches++;
+    if ((originalResult.rawMatches[i] || '') !== (refactorResult.rawMatches[i] || '')) mismatches++;
+    if ((originalResult.finalMatches[i] || '') !== (refactorResult.finalMatches[i] || '')) mismatches++;
+  }
+
+  return {
+    mismatchCount: mismatches,
+    message: mismatches === 0 ? 'OK (0 diferencias)' : ('DIFERENCIAS=' + mismatches)
+  };
+}
+
+function upgValidateFinalEquivalenceFromSheets() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  upgEnsureStructure(ss);
+
+  var cfg = upgReadConfig(ss.getSheetByName(UPG.SHEETS.CONFIG));
+  var lines = upgReadSingleColumn(ss.getSheetByName(UPG.SHEETS.LOG2_RAW));
+  var mappings = upgReadFinalMappings(cfg);
+
+  var originalResult = upgComputeFinalStatusOriginalLiteral(lines, mappings.findList, mappings.replaceList);
+  var refactorResult = upgComputeFinalStatusRefactor(lines, mappings.findList, mappings.replaceList);
+  var validation = upgCompareFinalResults(originalResult, refactorResult);
+
+  upgTrace('VALIDACION_EQUIVALENCIA', validation.message, validation.mismatchCount);
+  SpreadsheetApp.getActive().toast('Validación equivalencia final: ' + validation.message);
+}
+
+/* =========================
+   ETAPA 5
+   ========================= */
+
+function upgStage5Finalize() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  upgEnsureStructure(ss);
+
+  var cfgSheet = ss.getSheetByName(UPG.SHEETS.CONFIG);
+  var cfg = upgReadConfig(cfgSheet);
+  var finalSheet = ss.getSheetByName(UPG.SHEETS.FINAL);
+
+  var data = upgReadRangeData(finalSheet, 2, 1, 6);
+  var okCount = 0;
+  var reviewCount = 0;
+
+  for (var i = 0; i < data.length; i++) {
+    if (data[i][3] === UPG.STATUS.OK) okCount++;
+    else reviewCount++;
+  }
+
+  upgSetCurrentStage(cfgSheet, cfg.autoAdvance ? UPG.STAGE.PREP_DISPLAY : UPG.STAGE.FINAL_RESULT);
+  upgTrace('ETAPA_5', 'Cierre OK=' + okCount + ' REVISAR=' + reviewCount, data.length);
+  SpreadsheetApp.getActive().toast('Etapa 5 finalizada: OK=' + okCount + ' | REVISAR=' + reviewCount);
+}
+
+/* =========================
+   ANALISIS LOG1
+   ========================= */
+
+function upgAnalyzeBlocksForLog1(blocks, cfg) {
+  var rows = [];
+
+  for (var i = 0; i < blocks.length; i++) {
+    var block = blocks[i];
+    var gName = upgExtraerNombreDesdeLineaG(block.gLine);
+    var display = upgBuildDisplay(block.gLine);
+    var evalResult = upgEvaluateLog1Block(block.lines, gName, cfg);
+
+    rows.push([
+      block.gLine,
+      gName,
+      evalResult.numero,
+      evalResult.nombre,
+      evalResult.sim,
+      evalResult.status,
+      evalResult.dup ? 'SI' : 'NO',
+      display,
+      upgInsertNumberIntoDisplay(display, evalResult.numero),
+      block.lines.join('\n'),
+      evalResult.matchLine,
+      evalResult.note,
+      evalResult.confidencia,
+      evalResult.motivoDecision
+    ]);
+  }
+
+  return rows;
+}
+
+function upgEvaluateLog1Block(lines, gName, cfg) {
+  if (!gName) {
+    return {
+      numero: '',
+      nombre: '',
+      sim: 0,
+      status: UPG.STATUS.NO_MATCH,
+      dup: false,
+      matchLine: '',
+      note: 'No se pudo extraer nombre G.',
+      confianza: 0,
+      motivoDecision: 'Nombre G vacío o inválido.'
+    };
+  }
+
+  var minSim = gName.length < 5 ? cfg.minShort : cfg.minLong;
+  var best = { numero: '', nombre: '', sim: 0, line: '' };
+  var dups = {};
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+
+    if (line.indexOf(cfg.keywordDocv) !== -1) {
+      return {
+        numero: '',
+        nombre: '',
+        sim: 0,
+        status: UPG.STATUS.DOCV,
+        dup: false,
+        matchLine: line,
+        note: 'Caso DOCV.',
+        confianza: 100,
+        motivoDecision: 'Keyword DOCV detectada en bloque.'
+      };
+    }
+
+    if (line.indexOf('‡') === 0 || line.indexOf('TICKETLESS') !== -1) {
+      return {
+        numero: '1',
+        nombre: gName,
+        sim: 1,
+        status: UPG.STATUS.OK,
+        dup: false,
+        matchLine: line,
+        note: 'Shortcut ticketless/‡.',
+        confianza: 98,
+        motivoDecision: 'Regla directa ticketless/‡.'
+      };
+    }
+
+    if (!/^\d/.test(line)) continue;
+
+    var num = upgExtraerNumero(line);
+    var foundName = upgExtraerNombreDesdeLineaNumerada(line);
+    if (!foundName) continue;
+
+    var norm = upgNormalizarNombre(foundName);
+    if (cfg.commonWords[norm]) continue;
+
+    var dupKey = upgConstruirNombreBaseDuplicidad(foundName, cfg.blacklist);
+    if (dupKey) dups[dupKey] = (dups[dupKey] || 0) + 1;
+
+    var sim = upgCompararSimilitudNombreCompleto(gName, foundName);
+    if (upgNormalizarNombre(gName) === norm) {
+      best = { numero: num, nombre: foundName, sim: 1, line: line };
+      break;
+    }
+
+    if (sim >= minSim && sim > best.sim) {
+      best = { numero: num, nombre: foundName, sim: sim, line: line };
+    }
+  }
+
+  var dup = Object.keys(dups).some(function (k) { return dups[k] > 1; });
+
+  if (best.sim >= minSim) {
+    var relation = upgValidarRelacionNombre(gName, best.nombre, cfg.minWord);
+    if (dup && relation === UPG.STATUS.OK) relation = UPG.STATUS.REVIEW;
+
+    var confidence = Math.max(0, Math.min(100, Math.round(best.sim * 100)));
+    if (relation === UPG.STATUS.REVIEW) confidence = Math.min(confidence, 79);
+
+    return {
+      numero: best.numero,
+      nombre: best.nombre,
+      sim: best.sim,
+      status: relation,
+      dup: dup,
+      matchLine: best.line,
+      note: dup ? UPG.STATUS.DUP : '',
+      confianza: confidence,
+      motivoDecision: relation === UPG.STATUS.OK
+        ? 'Coincidencia válida sobre umbral.'
+        : (dup ? 'Coincidencia con posibles duplicados.' : 'Coincidencia parcial, requiere revisión.')
+    };
+  }
+
+  return {
+    numero: '',
+    nombre: '',
+    sim: best.sim,
+    status: UPG.STATUS.NO_MATCH,
+    dup: dup,
+    matchLine: '',
+    note: 'No alcanzó umbral.',
+    confianza: Math.max(0, Math.min(100, Math.round((best.sim || 0) * 100))),
+    motivoDecision: 'No hubo match confiable según umbral configurado.'
+  };
+}
+
+/* =========================
+   ESTRUCTURA / CONFIG
+   ========================= */
+
+function upgEnsureStructure(ss) {
+  var rawTxn = upgGetOrCreateSheet(ss, UPG.SHEETS.RAW_TXN);
+  var display = upgGetOrCreateSheet(ss, UPG.SHEETS.DISPLAY_OUT);
+  var log1 = upgGetOrCreateSheet(ss, UPG.SHEETS.LOG1_RAW);
+  var log1Analysis = upgGetOrCreateSheet(ss, UPG.SHEETS.LOG1_ANALISIS);
+  var pass2 = upgGetOrCreateSheet(ss, UPG.SHEETS.SABRE_PASS2);
+  var log2 = upgGetOrCreateSheet(ss, UPG.SHEETS.LOG2_RAW);
+  var finalSheet = upgGetOrCreateSheet(ss, UPG.SHEETS.FINAL);
+  var config = upgGetOrCreateSheet(ss, UPG.SHEETS.CONFIG);
+  var trace = upgGetOrCreateSheet(ss, UPG.SHEETS.TRACE);
+
+  upgEnsureHeaders(rawTxn, [['RAW_TRANSACCION']]);
+  upgEnsureHeaders(display, [['RAW_TRANSACCION', 'DISPLAY_CMD', 'ESTADO', 'ACCION_OPERADOR']]);
+  upgEnsureHeaders(log1, [['LOG1_LINEA']]);
+  upgEnsureHeaders(log1Analysis, [[
+    'G_LINE', 'NOMBRE_G', 'MATCH_NUMERO', 'MATCH_NOMBRE', 'SIMILITUD', 'ESTADO', 'DUPLICADO',
+    'DISPLAY_BASE', 'DISPLAY_CON_NUMERO', 'BLOQUE_LINEAS', 'MATCH_LINEA', 'NOTA', 'CONFIDENCIA', 'MOTIVO_DECISION'
+  ]]);
+  upgEnsureHeaders(pass2, [['G_LINE', 'COMANDO_SABRE_P2', 'ESTADO', 'ACCION_OPERADOR', 'NOTA']]);
+  upgEnsureHeaders(log2, [['LOG2_LINEA']]);
+  upgEnsureHeaders(finalSheet, [['G_LINE', 'MATCH_ORIGINAL', 'MATCH_FINAL', 'ESTADO_FINAL', 'CONFIDENCIA', 'MOTIVO_DECISION']]);
+  upgEnsureHeaders(trace, [['TIMESTAMP', 'ETAPA', 'EVENTO', 'CANTIDAD', 'USUARIO']]);
+
+  upgEnsureConfig(config);
+}
+
+function upgEnsureConfig(sheet) {
+  var defaults = {
+    CURRENT_STAGE: '1',
+    AUTO_ADVANCE_STAGE: 'TRUE',
+    MIN_SIMILITUD_LARGA: '0.80',
+    MIN_SIMILITUD_CORTA: '0.90',
+    MIN_WORD_SIM: '0.93',
+    PALABRAS_COMUNES: 'angel,joy,passenger,list,doc',
+    TOKENS_BLACKLIST: 'gru,cwb,poa,for,ccp,anf,lsc,clo,bog,smr,nb,aci,sl,ff,plt,gld,blk,glp,sig,prch,docs,eti,et,ae,ob,bf,bg,ak,af,q,o,m,v,c,f,i',
+    KEYWORD_DOCV: UPG.STATUS.DOCV,
+    FINAL_FIND_LIST: '',
+    FINAL_REPLACE_LIST: ''
+  };
+
+  var existing = {};
+  if (sheet.getLastRow() > 1) {
+    var current = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+    current.forEach(function (r) {
+      var k = upgSafeTrim(r[0]);
+      if (k) existing[k] = r[1];
+    });
+  }
+
+  var rows = [['KEY', 'VALUE']];
+  Object.keys(defaults).forEach(function (key) {
+    rows.push([key, existing[key] !== undefined ? existing[key] : defaults[key]]);
+  });
+
+  sheet.clear();
+  sheet.getRange(1, 1, rows.length, 2).setValues(rows);
+  sheet.setFrozenRows(1);
+}
+
+function upgReadConfig(sheet) {
+  var cfg = {};
+  if (sheet.getLastRow() > 1) {
+    var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+    values.forEach(function (r) {
+      var k = upgSafeTrim(r[0]);
+      if (k) cfg[k] = r[1];
+    });
+  }
+
+  return {
+    currentStage: Number(cfg.CURRENT_STAGE || 1),
+    autoAdvance: String(cfg.AUTO_ADVANCE_STAGE || 'TRUE').toUpperCase() === 'TRUE',
+    minLong: Number(cfg.MIN_SIMILITUD_LARGA || 0.8),
+    minShort: Number(cfg.MIN_SIMILITUD_CORTA || 0.9),
+    minWord: Number(cfg.MIN_WORD_SIM || 0.93),
+    commonWords: upgCsvSet(cfg.PALABRAS_COMUNES),
+    blacklist: upgCsvSet(cfg.TOKENS_BLACKLIST),
+    keywordDocv: String(cfg.KEYWORD_DOCV || UPG.STATUS.DOCV),
+    finalFindList: cfg.FINAL_FIND_LIST || '',
+    finalReplaceList: cfg.FINAL_REPLACE_LIST || ''
+  };
+}
+
+function upgSetCurrentStage(configSheet, stage) {
+  var data = configSheet.getRange(2, 1, Math.max(configSheet.getLastRow() - 1, 1), 2).getValues();
+  for (var i = 0; i < data.length; i++) {
+    if (data[i][0] === 'CURRENT_STAGE') {
+      configSheet.getRange(i + 2, 2).setValue(String(stage));
+      return;
+    }
+  }
+}
+
+/* =========================
+   UTILITARIOS SHEET / TRACE
+   ========================= */
+
+function upgGetOrCreateSheet(ss, name) {
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function upgEnsureHeaders(sheet, headers2D) {
+  var neededCols = headers2D[0].length;
+  if (sheet.getMaxColumns() < neededCols) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), neededCols - sheet.getMaxColumns());
+  }
+
+  var current = sheet.getRange(1, 1, 1, neededCols).getValues()[0].join('|');
+  var target = headers2D[0].join('|');
+  if (current !== target) {
+    sheet.getRange(1, 1, 1, neededCols).setValues(headers2D);
+  }
+  sheet.setFrozenRows(1);
+}
+
+function upgReadSingleColumn(sheet) {
+  var last = sheet.getLastRow();
+  if (last < 2) return [];
+
+  return sheet.getRange(2, 1, last - 1, 1).getValues().map(function (r) {
+    return upgSafeTrim(r[0]);
+  }).filter(Boolean);
+}
+
+function upgReadRangeData(sheet, startRow, startCol, width) {
+  var last = sheet.getLastRow();
+  if (last < startRow) return [];
+
+  var rows = sheet.getRange(startRow, startCol, last - startRow + 1, width).getValues();
+  return rows.filter(function (r) {
+    return r.join('').toString().trim() !== '';
+  });
+}
+
+function upgClearDataRows(sheet, width) {
+  var maxRows = Math.max(sheet.getMaxRows() - 1, 1);
+  sheet.getRange(2, 1, maxRows, width).clearContent().setBackground(null);
+}
+
+function upgPaintByStatus(sheet, rows, startRow, width, statusColIndex) {
+  if (!rows.length) return;
+
+  var colors = [];
+  for (var i = 0; i < rows.length; i++) {
+    var status = rows[i][statusColIndex];
+    var color = '#f4cccc';
+    if (status === UPG.STATUS.OK) color = '#d9ead3';
+    else if (status === UPG.STATUS.REVIEW) color = '#fff2cc';
+    else if (status === UPG.STATUS.DOCV) color = '#cfe2f3';
+
+    var rowColors = [];
+    for (var j = 0; j < width; j++) rowColors.push(color);
+    colors.push(rowColors);
+  }
+
+  sheet.getRange(startRow, 1, rows.length, width).setBackgrounds(colors);
+}
+
+function upgTrace(stage, event, count) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(UPG.SHEETS.TRACE);
+  if (!sheet) return;
+
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, 5).setValues([[
+    new Date(),
+    stage,
+    event,
+    String(count || 0),
+    Session.getActiveUser().getEmail()
+  ]]);
+}
+
+/* =========================
+   PARSEO / MATCHING
+   ========================= */
+
+function upgBuildBlocks(lines) {
+  var blocks = [];
+  var i = 0;
+
+  while (i < lines.length) {
+    var line = lines[i];
+    if (!line || line.indexOf('G-') !== 0) {
+      i++;
+      continue;
+    }
+
+    var block = { gLine: line, lines: [] };
+    i++;
+
+    while (i < lines.length) {
+      var next = lines[i];
+      if (!next) {
+        i++;
+        continue;
+      }
+
+      if (next.indexOf('IGD') === 0) {
+        i++; // consume IGD
+        break;
+      }
+
+      if (next.indexOf('G-') === 0) {
+        break; // siguiente bloque, no consumir
+      }
+
+      block.lines.push(next);
+      i++;
+    }
+
+    blocks.push(block);
+  }
+
+  return blocks;
+}
+
+function upgBuildDisplay(rawText) {
+  if (!rawText) return '';
+  var text = String(rawText);
+  var idx = text.indexOf('‡');
+  var until = idx !== -1 ? text.substring(0, idx) : text;
+  if (until.slice(-5) === '^EI^E') return until;
+  return until.replace(/(\^)+$/, '') + '^EI^E';
+}
+
+function upgInsertNumberIntoDisplay(displayText, numero) {
+  if (!displayText || !numero) return displayText || '';
+
+  var parts = String(displayText).split('^');
+  var before = parts[0];
+  var after = parts.slice(1).join('^');
+
+  var patched = after
+    .replace(/\bEG-(?!\d)/g, 'EG-' + numero)
+    .replace(/\bKG(?!\d|[-])/g, 'KG' + numero);
+
+  return before + '^' + patched;
+}
+
+function upgExtraerNumero(linea) {
+  var m = String(linea || '').match(/^\d+/);
+  return m ? m[0] : '';
+}
+
+function upgExtraerNombreDesdeLineaG(gLine) {
+  if (!gLine) return '';
+
+  var parts = String(gLine).split('-');
+  if (parts.length < 3) return '';
+
+  var name = parts.slice(2).join('-');
+  if (name.indexOf('‡') !== -1) name = name.substring(0, name.indexOf('‡'));
+  if (name.indexOf('^') !== -1) name = name.substring(0, name.indexOf('^'));
+
+  return name
+    .replace(/[^\p{L}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function upgExtraerNombreDesdeLineaNumerada(linea) {
+  if (!linea) return '';
+
+  var noNum = String(linea).replace(/^\d+\s*/, '');
+  return noNum
+    .replace(/[^\p{L}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function upgConstruirNombreBaseDuplicidad(nombreCompleto, blacklistSet) {
+  var tokens = upgNormalizarNombre(nombreCompleto).split(' ').filter(Boolean);
+  if (tokens.length < 2) return '';
+
+  var clean = tokens.filter(function (token) {
+    return !upgEsTokenNoNombre(token, blacklistSet);
+  });
+
+  return clean.length >= 2 ? clean.join(' ') : '';
+}
+
+function upgEsTokenNoNombre(token, blacklistSet) {
+  if (!token) return true;
+  if (blacklistSet && blacklistSet[token]) return true;
+  if (/^\d+[a-z]*$/i.test(token)) return true;
+  if (/^[a-z]\d+[a-z]*$/i.test(token)) return true;
+  if (/^\d+[a-z]+\*?$/i.test(token)) return true;
+  if (/^[a-z]+\d+\*?$/i.test(token)) return true;
+  return token.length === 1;
+}
+
+function upgNormalizarNombre(nombre) {
+  return String(nombre || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z\s]/g, '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function upgValidarRelacionNombre(nombreOriginal, nombreEncontrado, minWordSimilarity) {
+  var original = upgNormalizarNombre(nombreOriginal).split(' ').filter(Boolean);
+  var found = upgNormalizarNombre(nombreEncontrado).split(' ').filter(Boolean);
+  var minWord = minWordSimilarity || 0.93;
+
+  if (!original.length || !found.length) return UPG.STATUS.NO_MATCH;
+  if (original.join(' ') === found.join(' ')) return UPG.STATUS.OK;
+
+  var common = original.filter(function (p) { return found.indexOf(p) !== -1; });
+  if (common.length >= 2) return UPG.STATUS.REVIEW;
+
+  var strong = 0;
+  for (var i = 0; i < original.length; i++) {
+    for (var j = 0; j < found.length; j++) {
+      if (upgJaroWinkler(original[i], found[j]) >= minWord) {
+        strong++;
         break;
       }
     }
   }
 
-  if (coincidenciasFuertes >= 2) {
-    return "REVISAR";
-  }
-
-  return "SIN RELACION";
+  return strong >= 2 ? UPG.STATUS.REVIEW : UPG.STATUS.NO_REL;
 }
-
-/* =========================
-   EXTRACCIÓN / LIMPIEZA
-   ========================= */
-
-function upgSafeTrim(valor) {
-  return typeof valor === 'string' ? valor.trim() : null;
-}
-
-function upgExtraerNumero(linea) {
-  const match = linea.toString().match(/^\d+/);
-  return match ? match[0] : "";
-}
-
-function upgExtraerNombreDesdeLineaG(gLine) {
-  if (!gLine) return null;
-
-  const partes = gLine.split("-");
-  if (partes.length < 3) return null;
-
-  let nombre = partes.slice(2).join("-");
-
-  if (nombre.indexOf("‡") !== -1) {
-    nombre = nombre.substring(0, nombre.indexOf("‡"));
-  }
-
-  if (nombre.indexOf("^") !== -1) {
-    nombre = nombre.substring(0, nombre.indexOf("^"));
-  }
-
-  nombre = nombre
-    .replace(/[^\p{L}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return nombre || null;
-}
-
-function upgExtraerNombreDesdeLineaNumerada(linea) {
-  if (!linea) return null;
-
-  const sinNumero = linea.toString().replace(/^\d+\s*/, '');
-
-  const limpio = sinNumero
-    .replace(/[^\p{L}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  return limpio || null;
-}
-
-function upgConstruirNombreBaseDuplicidad(nombreCompleto) {
-  const partes = upgNormalizarNombre(nombreCompleto).split(" ").filter(Boolean);
-  if (partes.length < 2) return "";
-
-  const tokensLimpios = partes.filter(function(token) {
-    return !upgEsTokenNoNombre(token);
-  });
-
-  if (tokensLimpios.length < 2) return "";
-
-  return tokensLimpios.join(" ");
-}
-
-function upgEsTokenNoNombre(token) {
-  const blacklist = [
-    'gru', 'cwb', 'poa', 'for', 'ccp', 'anf', 'lsc', 'clo', 'bog', 'smr',
-    'nb', 'aci', 'sl', 'ff', 'plt', 'gld', 'blk', 'glp', 'sig', 'prch',
-    'docs', 'eti', 'et', 'ae', 'ob', 'bf', 'bg', 'ak', 'af', 'q', 'o',
-    'm', 'v', 'c', 'f', 'i'
-  ];
-
-  if (!token) return true;
-  if (blacklist.includes(token)) return true;
-  if (/^\d+[a-z]*$/i.test(token)) return true;
-  if (/^[a-z]\d+[a-z]*$/i.test(token)) return true;
-  if (/^\d+[a-z]+\*?$/i.test(token)) return true;
-  if (/^[a-z]+\d+\*?$/i.test(token)) return true;
-  if (token.length === 1) return true;
-
-  return false;
-}
-
-function upgNormalizarNombre(nombre) {
-  return (nombre || "")
-    .toString()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-zA-Z\s]/g, "")
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-/* =========================
-   SIMILITUD
-   ========================= */
 
 function upgCompararSimilitudNombreCompleto(nombre1, nombre2) {
-  const partes1 = upgNormalizarNombre(nombre1).split(' ').filter(Boolean);
-  const partes2 = upgNormalizarNombre(nombre2).split(' ').filter(Boolean);
+  var p1 = upgNormalizarNombre(nombre1).split(' ').filter(Boolean);
+  var p2 = upgNormalizarNombre(nombre2).split(' ').filter(Boolean);
 
-  if (!partes1.length || !partes2.length) return 0;
+  if (!p1.length || !p2.length) return 0;
 
   if (nombre1.length < 5 || nombre2.length < 5) {
     return upgJaroWinkler(upgNormalizarNombre(nombre1), upgNormalizarNombre(nombre2));
   }
 
-  let puntajeTotal = 0;
-  let comparaciones = 0;
+  var total = 0;
+  for (var i = 0; i < p1.length; i++) {
+    var best = 0;
+    for (var j = 0; j < p2.length; j++) {
+      var sim = upgJaroWinkler(p1[i], p2[j]);
+      if (sim > best) best = sim;
+    }
+    total += best;
+  }
 
-  partes1.forEach(parte1 => {
-    let mejorSimilitud = 0;
-
-    partes2.forEach(parte2 => {
-      const similitud = upgJaroWinkler(parte1, parte2);
-      if (similitud > mejorSimilitud) {
-        mejorSimilitud = similitud;
-      }
-    });
-
-    puntajeTotal += mejorSimilitud;
-    comparaciones++;
-  });
-
-  return comparaciones > 0 ? puntajeTotal / comparaciones : 0;
+  return total / p1.length;
 }
 
-/* =========================
-   JARO-WINKLER
-   ========================= */
-
 function upgJaroWinkler(s1, s2) {
-  const jaro = upgJaroDistance(s1, s2);
-  const prefixLength = upgPrefixLength(s1, s2);
-  return jaro + (0.1 * prefixLength * (1 - jaro));
+  var j = upgJaroDistance(s1, s2);
+  var p = upgPrefixLength(s1, s2);
+  return j + (0.1 * p * (1 - j));
 }
 
 function upgJaroDistance(s1, s2) {
   if (!s1 || !s2) return 0;
   if (s1 === s2) return 1;
 
-  const matchWindow = Math.floor(Math.max(s1.length, s2.length) / 2) - 1;
-  const matches1 = new Array(s1.length).fill(false);
-  const matches2 = new Array(s2.length).fill(false);
-  let matches = 0;
+  var mw = Math.floor(Math.max(s1.length, s2.length) / 2) - 1;
+  var m1 = new Array(s1.length).fill(false);
+  var m2 = new Array(s2.length).fill(false);
+  var matches = 0;
 
-  for (let i = 0; i < s1.length; i++) {
-    const start = Math.max(0, i - matchWindow);
-    const end = Math.min(i + matchWindow + 1, s2.length);
+  for (var i = 0; i < s1.length; i++) {
+    var start = Math.max(0, i - mw);
+    var end = Math.min(i + mw + 1, s2.length);
 
-    for (let j = start; j < end; j++) {
-      if (matches2[j]) continue;
+    for (var j = start; j < end; j++) {
+      if (m2[j]) continue;
       if (s1[i] !== s2[j]) continue;
-
-      matches1[i] = true;
-      matches2[j] = true;
+      m1[i] = true;
+      m2[j] = true;
       matches++;
       break;
     }
   }
 
-  if (matches === 0) return 0;
+  if (!matches) return 0;
 
-  let t = 0;
-  let k = 0;
-
-  for (let i = 0; i < s1.length; i++) {
-    if (!matches1[i]) continue;
-    while (!matches2[k]) k++;
+  var t = 0;
+  var k = 0;
+  for (i = 0; i < s1.length; i++) {
+    if (!m1[i]) continue;
+    while (!m2[k]) k++;
     if (s1[i] !== s2[k]) t++;
     k++;
   }
@@ -635,13 +972,34 @@ function upgJaroDistance(s1, s2) {
 }
 
 function upgPrefixLength(s1, s2) {
-  let prefixLength = 0;
-  const maxPrefixLength = 4;
+  var len = 0;
+  var maxLen = Math.min(4, s1.length, s2.length);
 
-  for (let i = 0; i < Math.min(s1.length, s2.length); i++) {
+  for (var i = 0; i < maxLen; i++) {
     if (s1[i] !== s2[i]) break;
-    prefixLength++;
+    len++;
   }
 
-  return Math.min(prefixLength, maxPrefixLength);
+  return len;
+}
+
+function upgCsvSet(csv) {
+  var set = {};
+  String(csv || '')
+    .split(',')
+    .map(function (x) { return upgNormalizarNombre(x); })
+    .filter(Boolean)
+    .forEach(function (x) { set[x] = true; });
+  return set;
+}
+
+function upgCsvArray(csv) {
+  return String(csv || '')
+    .split(',')
+    .map(function (x) { return upgSafeTrim(x); })
+    .filter(Boolean);
+}
+
+function upgSafeTrim(value) {
+  return typeof value === 'string' ? value.trim() : '';
 }
